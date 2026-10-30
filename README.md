@@ -1,3 +1,5 @@
+![Banner](banner.png)
+
 # monitor-autoruns
 Monitors changes to autorun locations (registry keys, startup folders) to detect malware persistence mechanisms. - Focused on System monitoring and alerts
 
