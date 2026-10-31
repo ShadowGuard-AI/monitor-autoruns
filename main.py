@@ -1,9 +1,14 @@
 import argparse
 import logging
 import os
+import sys
 import time
-import psutil
-import winreg  # Windows-specific registry access
+
+try:
+    import winreg  # Windows-specific registry access
+except ImportError:
+    print("Error: this tool runs on Windows only, because the winreg module is not available on this platform.")
+    sys.exit(1)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -24,6 +29,13 @@ STARTUP_FOLDERS = [
     r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Startup"  # Check for existence before using
 ]
 
+# Both hives are monitored: the current user hive and the machine
+# hive, whose Run and RunOnce entries apply to every user.
+REGISTRY_HIVES = [
+    (winreg.HKEY_CURRENT_USER, "HKEY_CURRENT_USER"),
+    (winreg.HKEY_LOCAL_MACHINE, "HKEY_LOCAL_MACHINE"),
+]
+
 
 def setup_argparse():
     """Sets up the argument parser for the command-line interface."""
@@ -38,29 +50,38 @@ def setup_argparse():
     return parser.parse_args()
 
 
-def get_registry_autoruns(location):
+def get_registry_autoruns_status(location, hive=None):
     """
-    Retrieves autorun entries from a specified registry location.
+    Retrieves autorun entries from a specified registry location, with
+    a read status that keeps an unreadable location distinct from a
+    location that was read and found empty.
 
     Args:
         location (str): The registry key location to check.
+        hive: The registry hive to open the location under. Defaults
+              to HKEY_CURRENT_USER.
 
     Returns:
-        dict: A dictionary containing the name and data of each autorun entry.
-              Returns an empty dictionary if the location doesn't exist or cannot be accessed.
+        A tuple (entries, status, reason). status is "read" when the
+        location was opened and enumerated, or "missing",
+        "permission", or "error" when it could not be read, with a
+        short reason. entries is empty in both the read-and-empty and
+        the unreadable cases; status is what tells them apart.
     """
+    if hive is None:
+        hive = winreg.HKEY_CURRENT_USER
     autoruns = {}
     try:
-        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, location, 0, winreg.KEY_READ) # Added permission
+        key = winreg.OpenKey(hive, location, 0, winreg.KEY_READ) # Added permission
     except FileNotFoundError:
         logging.warning(f"Registry location not found: {location}")
-        return {}
+        return {}, "missing", "key not found"
     except PermissionError:
         logging.error(f"Permission denied accessing registry location: {location}")
-        return {}
+        return {}, "permission", "permission denied"
     except Exception as e:
         logging.error(f"Error accessing registry location {location}: {e}")
-        return {}
+        return {}, "error", str(e)
 
     try:
         i = 0
@@ -73,24 +94,35 @@ def get_registry_autoruns(location):
                 break
     finally:
         winreg.CloseKey(key)
-    return autoruns
+    return autoruns, "read", ""
 
-def get_startup_folder_autoruns(folder):
+
+def get_registry_autoruns(location, hive=None):
     """
-    Retrieves autorun entries from a specified startup folder.
-
-    Args:
-        folder (str): The path to the startup folder.
+    Retrieves autorun entries from a specified registry location.
 
     Returns:
-        list: A list of files in the startup folder.
-              Returns an empty list if the folder doesn't exist or cannot be accessed.
+        dict: A dictionary containing the name and data of each autorun entry.
+              Returns an empty dictionary if the location doesn't exist or cannot be accessed.
     """
-    autoruns = []
+    autoruns, _status, _reason = get_registry_autoruns_status(location, hive)
+    return autoruns
+
+def get_startup_folder_autoruns_status(folder):
+    """
+    Retrieves autorun entries from a specified startup folder, with a
+    read status that keeps an unreadable or missing folder distinct
+    from a folder that was read and found empty.
+
+    Returns:
+        A tuple (entries, status, reason). entries is a sorted list,
+        so comparisons never depend on directory listing order.
+    """
     if not os.path.exists(folder):
         logging.warning(f"Startup folder not found: {folder}")
-        return []
+        return [], "missing", "folder not found"
 
+    autoruns = []
     try:
         for filename in os.listdir(folder):
             filepath = os.path.join(folder, filename)
@@ -98,11 +130,23 @@ def get_startup_folder_autoruns(folder):
                 autoruns.append(filepath)
     except OSError as e:
         logging.error(f"Error accessing startup folder {folder}: {e}")
-        return []
+        return [], "error", str(e)
     except Exception as e:
         logging.error(f"Unexpected error accessing startup folder {folder}: {e}")
-        return []
+        return [], "error", str(e)
 
+    return sorted(autoruns), "read", ""
+
+
+def get_startup_folder_autoruns(folder):
+    """
+    Retrieves autorun entries from a specified startup folder.
+
+    Returns:
+        list: A sorted list of files in the startup folder.
+              Returns an empty list if the folder doesn't exist or cannot be accessed.
+    """
+    autoruns, _status, _reason = get_startup_folder_autoruns_status(folder)
     return autoruns
 
 
@@ -131,19 +175,56 @@ def monitor_autoruns(interval, log_file, report_file, verbose):
          logging.getLogger('').setLevel(logging.INFO)
 
 
-    previous_registry_states = {}
-    previous_startup_folder_states = {}
+    def read_registry_states():
+        """Reads every registry location in both hives, keeping the
+        coverage (which locations were read, and which could not be
+        read and why) separate from the entry states."""
+        states = {}
+        unreadable = []
+        read_count = 0
+        entry_count = 0
+        for hive, hive_name in REGISTRY_HIVES:
+            for location in REGISTRY_LOCATIONS:
+                label = f"{hive_name}\\{location}"
+                entries, status, reason = get_registry_autoruns_status(location, hive)
+                states[label] = entries
+                if status == "read":
+                    read_count += 1
+                    entry_count += len(entries)
+                else:
+                    unreadable.append(f"{label} ({status}: {reason})")
+        return states, read_count, entry_count, unreadable
 
-    for location in REGISTRY_LOCATIONS:
-        previous_registry_states[location] = get_registry_autoruns(location)
+    def read_startup_states():
+        states = {}
+        unreadable = []
+        read_count = 0
+        for folder in STARTUP_FOLDERS:
+            entries, status, reason = get_startup_folder_autoruns_status(folder)
+            states[folder] = entries
+            if status == "read":
+                read_count += 1
+            else:
+                unreadable.append(f"{folder} ({status}: {reason})")
+        return states, read_count, unreadable
 
-    for folder in STARTUP_FOLDERS:
-        if os.path.exists(folder): # only monitor if path exist
-            previous_startup_folder_states[folder] = get_startup_folder_autoruns(folder)
-        else:
-            previous_startup_folder_states[folder] = []
+    def log_coverage(when, reg_read, reg_entries, reg_unreadable, folder_read, folder_unreadable):
+        total_locations = len(REGISTRY_HIVES) * len(REGISTRY_LOCATIONS)
+        logging.info(
+            f"Coverage {when}: registry locations read {reg_read} of {total_locations} "
+            f"({reg_entries} entries); registry locations that could not be read: "
+            f"{reg_unreadable if reg_unreadable else 'none'}; startup folders read "
+            f"{folder_read} of {len(STARTUP_FOLDERS)}; startup folders that could not be read: "
+            f"{folder_unreadable if folder_unreadable else 'none'}."
+        )
+        if reg_read == 0 and folder_read == 0:
+            logging.warning("Coverage warning: no autorun location could be read; the monitor is watching nothing it can verify.")
+
+    previous_registry_states, reg_read, reg_entries, reg_unreadable = read_registry_states()
+    previous_startup_folder_states, folder_read, folder_unreadable = read_startup_states()
 
     logging.info("Initial autorun states captured.")
+    log_coverage("at startup", reg_read, reg_entries, reg_unreadable, folder_read, folder_unreadable)
 
     while True:
         try:
@@ -153,53 +234,55 @@ def monitor_autoruns(interval, log_file, report_file, verbose):
             report_lines = []  # Accumulate changes for the report
 
             # Check Registry Changes
-            for location in REGISTRY_LOCATIONS:
-                current_state = get_registry_autoruns(location)
-                if current_state != previous_registry_states[location]:
-                    logging.warning(f"Autorun changes detected in registry location: {location}")
+            current_registry_states, reg_read, reg_entries, reg_unreadable = read_registry_states()
+            for label in previous_registry_states:
+                current_state = current_registry_states[label]
+                previous_state = previous_registry_states[label]
+                if current_state != previous_state:
+                    logging.warning(f"Autorun changes detected in registry location: {label}")
 
-                    added = set(current_state.keys()) - set(previous_registry_states[location].keys())
-                    removed = set(previous_registry_states[location].keys()) - set(current_state.keys())
-                    modified = set(current_state.keys()) & set(previous_registry_states[location].keys())
+                    added = set(current_state.keys()) - set(previous_state.keys())
+                    removed = set(previous_state.keys()) - set(current_state.keys())
+                    modified = set(current_state.keys()) & set(previous_state.keys())
 
-                    if added:
-                        logging.info(f"Added registry entries in {location}: {added}")
-                        report_lines.append(f"Added registry entries in {location}: {added}")
-                    if removed:
-                        logging.info(f"Removed registry entries in {location}: {removed}")
-                        report_lines.append(f"Removed registry entries in {location}: {removed}")
+                    for name in sorted(added):
+                        line = f"Added registry entry in {label}: {name} = {current_state[name]}"
+                        logging.info(line)
+                        report_lines.append(line)
+                    for name in sorted(removed):
+                        line = f"Removed registry entry in {label}: {name} (last value: {previous_state[name]})"
+                        logging.info(line)
+                        report_lines.append(line)
                     if modified:
                         for key in modified:
-                            if current_state[key] != previous_registry_states[location][key]:
-                                logging.info(f"Modified registry entry in {location}: {key} (Old: {previous_registry_states[location][key]}, New: {current_state[key]})")
-                                report_lines.append(f"Modified registry entry in {location}: {key} (Old: {previous_registry_states[location][key]}, New: {current_state[key]})")
+                            if current_state[key] != previous_state[key]:
+                                logging.info(f"Modified registry entry in {label}: {key} (Old: {previous_state[key]}, New: {current_state[key]})")
+                                report_lines.append(f"Modified registry entry in {label}: {key} (Old: {previous_state[key]}, New: {current_state[key]})")
 
-                    previous_registry_states[location] = current_state
+                    previous_registry_states[label] = current_state
 
 
-            # Check Startup Folder Changes
+            # Check Startup Folder Changes. States are sorted lists, so
+            # a pure reordering of the same files is not a change.
+            current_startup_states, folder_read, folder_unreadable = read_startup_states()
             for folder in STARTUP_FOLDERS:
-                if os.path.exists(folder):
-                    current_state = get_startup_folder_autoruns(folder)
-                    if current_state != previous_startup_folder_states[folder]:
-                        logging.warning(f"Autorun changes detected in startup folder: {folder}")
+                current_state = current_startup_states[folder]
+                if sorted(current_state) != sorted(previous_startup_folder_states[folder]):
+                    logging.warning(f"Autorun changes detected in startup folder: {folder}")
 
-                        added = set(current_state) - set(previous_startup_folder_states[folder])
-                        removed = set(previous_startup_folder_states[folder]) - set(current_state)
+                    added = set(current_state) - set(previous_startup_folder_states[folder])
+                    removed = set(previous_startup_folder_states[folder]) - set(current_state)
 
-                        if added:
-                            logging.info(f"Added files in startup folder {folder}: {added}")
-                            report_lines.append(f"Added files in startup folder {folder}: {added}")
-                        if removed:
-                            logging.info(f"Removed files in startup folder {folder}: {removed}")
-                            report_lines.append(f"Removed files in startup folder {folder}: {removed}")
+                    if added:
+                        logging.info(f"Added files in startup folder {folder}: {added}")
+                        report_lines.append(f"Added files in startup folder {folder}: {added}")
+                    if removed:
+                        logging.info(f"Removed files in startup folder {folder}: {removed}")
+                        report_lines.append(f"Removed files in startup folder {folder}: {removed}")
 
-                        previous_startup_folder_states[folder] = current_state
-                else:
-                    if previous_startup_folder_states[folder]: # If folder existed and now it doesnt
-                        logging.warning(f"Startup folder {folder} has been removed or is inaccessible.")
-                        report_lines.append(f"Startup folder {folder} has been removed or is inaccessible.")
-                        previous_startup_folder_states[folder] = []
+                    previous_startup_folder_states[folder] = current_state
+
+            log_coverage("this cycle", reg_read, reg_entries, reg_unreadable, folder_read, folder_unreadable)
 
 
             # Write report to file if changes were detected.
@@ -222,6 +305,9 @@ def monitor_autoruns(interval, log_file, report_file, verbose):
 def main():
     """Main function to execute the autorun monitoring."""
     args = setup_argparse()
+    if args.interval <= 0:
+        logging.error("Interval must be a positive number of seconds.")
+        sys.exit(1)
     monitor_autoruns(args.interval, args.log_file, args.report_file, args.verbose)
 
 
@@ -229,7 +315,7 @@ if __name__ == "__main__":
     main()
 
 # Usage Examples:
-# 1. Run with default settings:  python autorun_monitor.py
-# 2. Run with a 30-second interval: python autorun_monitor.py -i 30
-# 3. Run with verbose output and custom log file: python autorun_monitor.py -v -l my_monitor.log
-# 4. Run with a custom report file and interval: python autorun_monitor.py -r my_report.txt -i 120
+# 1. Run with default settings:  python main.py
+# 2. Run with a 30-second interval: python main.py -i 30
+# 3. Run with verbose output and custom log file: python main.py -v -l my_monitor.log
+# 4. Run with a custom report file and interval: python main.py -r my_report.txt -i 120
