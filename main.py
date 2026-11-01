@@ -20,6 +20,10 @@ REGISTRY_LOCATIONS = [
     r"Software\Microsoft\Windows\CurrentVersion\RunServices",
     r"Software\Microsoft\Windows\CurrentVersion\RunServicesOnce",
     r"Software\Microsoft\Windows\CurrentVersion\Policies\Explorer\Run",
+    # The two Winlogon entries in this list are values inside a
+    # shared key, not keys of their own. I enumerate every value
+    # in that key, so changes to unrelated Winlogon values are
+    # reported as autorun changes alongside Userinit and Shell.
     r"Software\Microsoft\Windows NT\CurrentVersion\Winlogon\Userinit",
     r"Software\Microsoft\Windows NT\CurrentVersion\Winlogon\Shell"
 ]
@@ -90,6 +94,10 @@ def get_registry_autoruns_status(location, hive=None):
                 name, value, _ = winreg.EnumValue(key, i)
                 autoruns[name] = value
                 i += 1
+            # Any OSError ends the enumeration, not only the end of
+            # values signal. An error partway through gives me a shorter
+            # state for this cycle, and the comparison in the monitor
+            # loop reads the missing tail as removed entries.
             except OSError:  # No more values
                 break
     finally:
@@ -127,6 +135,11 @@ def get_startup_folder_autoruns_status(folder):
         for filename in os.listdir(folder):
             filepath = os.path.join(folder, filename)
             if os.path.isfile(filepath):  # Only list files
+                # A startup entry is recorded by path alone. Editing the
+                # file, or retargeting a shortcut in place, leaves my state
+                # identical, where a registry entry changing its data is
+                # caught because registry states carry values. The two
+                # halves of this monitor watch with different depth.
                 autoruns.append(filepath)
     except OSError as e:
         logging.error(f"Error accessing startup folder {folder}: {e}")
@@ -209,6 +222,11 @@ def monitor_autoruns(interval, log_file, report_file, verbose):
         return states, read_count, unreadable
 
     def log_coverage(when, reg_read, reg_entries, reg_unreadable, folder_read, folder_unreadable):
+        # Coverage counts both hives against the same location list,
+        # and neither hive is opened with an explicit 32 or 64 bit
+        # view. On a 64 bit system the separate Wow6432Node autorun
+        # locations are not in my list, so a 32 bit program's Run
+        # entry is outside the count I report.
         total_locations = len(REGISTRY_HIVES) * len(REGISTRY_LOCATIONS)
         logging.info(
             f"Coverage {when}: registry locations read {reg_read} of {total_locations} "
@@ -238,6 +256,11 @@ def monitor_autoruns(interval, log_file, report_file, verbose):
             for label in previous_registry_states:
                 current_state = current_registry_states[label]
                 previous_state = previous_registry_states[label]
+                # Polling sets the limit of what I can see: a change that is
+                # made and reverted between two cycles never existed as far
+                # as my states are concerned, and a change made while the
+                # monitor is stopped is folded silently into the next
+                # baseline whenever it restarts.
                 if current_state != previous_state:
                     logging.warning(f"Autorun changes detected in registry location: {label}")
 
